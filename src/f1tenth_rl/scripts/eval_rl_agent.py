@@ -7,6 +7,7 @@ import torch
 import argparse
 import time
 import os
+import yaml
 
 # Import ROS messages
 from sensor_msgs.msg import LaserScan
@@ -17,6 +18,12 @@ from ackermann_msgs.msg import AckermannDriveStamped
 from f1tenth_rl.environment import F1TenthEnv
 from f1tenth_rl.models.dqn import DQNAgent
 from f1tenth_rl.models.ppo import PPOAgent
+from f1tenth_rl.utils.rewards import (
+    DEFAULT_REWARD_PARAMS,
+    analyze_scan,
+    calculate_reward,
+    calculate_target_speed
+)
 
 class EvaluationNode(Node):
     def __init__(self, args):
@@ -28,6 +35,13 @@ class EvaluationNode(Node):
         self.num_episodes = args.num_episodes
         self.record_data = args.record_data
         self.visualization = args.visualization
+        self.config_data = self._load_config(args.reward_config)
+        self.reward_params = DEFAULT_REWARD_PARAMS.copy()
+        self.reward_params.update({
+            key: value for key, value in self.config_data.items()
+            if key in DEFAULT_REWARD_PARAMS
+        })
+        self.max_episode_steps = int(self.config_data.get('max_steps_per_episode', 1000))
         
         if self.record_data:
             self.data_dir = os.path.join('eval_data', time.strftime("%Y%m%d-%H%M%S"))
@@ -97,12 +111,28 @@ class EvaluationNode(Node):
         self.episode_reward = 0.0
         self.episode_started = False
         self.all_rewards = []
+        self.prev_action = None
+        self.prev_prev_action = None
+        self.prev_centerline_error = None
         
         self.get_logger().info(f"Evaluation node initialized with {self.algorithm} algorithm")
         self.get_logger().info(f"Will evaluate for {self.num_episodes} episodes")
         
         # Start evaluation loop
         self.timer = self.create_timer(0.1, self.evaluation_step)
+
+    def _load_config(self, config_path):
+        if not config_path:
+            return {}
+        try:
+            with open(config_path, 'r', encoding='utf-8') as handle:
+                data = yaml.safe_load(handle) or {}
+        except Exception as exc:
+            self.get_logger().warning(f"Failed to load config: {exc}")
+            return {}
+        if 'rl_agent' in data and 'ros__parameters' in data['rl_agent']:
+            return data['rl_agent']['ros__parameters'] or {}
+        return data
     
     def scan_callback(self, msg):
         """Store laser scan data"""
@@ -153,7 +183,9 @@ class EvaluationNode(Node):
         """Send drive command to the car"""
         msg = AckermannDriveStamped()
         msg.drive.steering_angle = float(steering)
-        msg.drive.speed = float(velocity)
+        min_speed = self.reward_params['min_speed']
+        max_speed = self.reward_params['max_speed']
+        msg.drive.speed = float(np.clip(velocity, min_speed, max_speed))
         self.drive_pub.publish(msg)
     
     def evaluation_step(self):
@@ -172,6 +204,9 @@ class EvaluationNode(Node):
             self.episode_started = True
             self.episode_reward = 0.0
             self.episode_steps = 0
+            self.prev_action = None
+            self.prev_prev_action = None
+            self.prev_centerline_error = None
             
             if self.record_data:
                 self.trajectory_data = []
@@ -200,7 +235,14 @@ class EvaluationNode(Node):
             action, _, _ = self.agent.select_action(state_tensor, deterministic=True)
             steering, velocity = action
         
-        # Execute action
+        scan_features = analyze_scan(self.latest_scan, self.reward_params)
+        target_speed = calculate_target_speed(self.latest_scan, self.reward_params, scan_features)
+        speed_limit = min(
+            self.reward_params['max_speed'],
+            target_speed + self.reward_params['speed_limit_buffer']
+        )
+        speed_limit = max(self.reward_params['min_speed'], speed_limit)
+        velocity = float(np.clip(velocity, self.reward_params['min_speed'], speed_limit))
         self.publish_drive_command(steering, velocity)
         
         # Update step count
@@ -212,12 +254,20 @@ class EvaluationNode(Node):
             reward, done = calculate_reward(
                 self.latest_scan,
                 self.latest_odom,
-                self.prev_odom
+                self.prev_odom,
+                action=[steering, velocity],
+                prev_action=self.prev_action,
+                prev_prev_action=self.prev_prev_action,
+                prev_centerline_error=self.prev_centerline_error,
+                config=self.reward_params
             )
+            self.prev_prev_action = self.prev_action
+            self.prev_action = [steering, velocity]
+            self.prev_centerline_error = scan_features['centerline_error']
             self.episode_reward += reward
             
             # Check for episode end
-            if done or self.episode_steps >= 1000:
+            if done or self.episode_steps >= self.max_episode_steps:
                 self.get_logger().info(
                     f"Episode {self.current_episode + 1} finished: "
                     f"Reward={self.episode_reward:.2f}, "
@@ -300,6 +350,8 @@ def main():
                         help='Record trajectory data')
     parser.add_argument('--visualization', action='store_true',
                         help='Enable visualization (not implemented yet)')
+    parser.add_argument('--reward-config', type=str, default='',
+                        help='YAML file with reward/speed profile parameters')
     
     args = parser.parse_args()
     

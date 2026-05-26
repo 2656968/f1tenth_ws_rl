@@ -8,11 +8,16 @@ from ackermann_msgs.msg import AckermannDriveStamped
 import numpy as np
 import torch
 import os
-import yaml
 from datetime import datetime
 from f1tenth_rl.environment import F1TenthEnv
 from f1tenth_rl.models.dqn import DQNAgent
-from f1tenth_rl.utils.rewards import calculate_reward
+from f1tenth_rl.utils.rewards import (
+    DEFAULT_REWARD_PARAMS,
+    analyze_scan,
+    calculate_reward,
+    calculate_target_speed
+)
+import time
 
 class RLAgentNode(Node):
     def __init__(self):
@@ -26,12 +31,16 @@ class RLAgentNode(Node):
         self.declare_parameter('start_x', 0.0)
         self.declare_parameter('start_y', 0.0)
         self.declare_parameter('start_yaw', 0.0)
+        self.declare_parameter('max_steps_per_episode', 1000)
+        self._declare_reward_params()
         
         # Get parameters
         self.training_mode = self.get_parameter('training_mode').value
         self.model_type = self.get_parameter('model_type').value
         self.model_path = self.get_parameter('model_path').value
         self.save_path = self.get_parameter('save_path').value
+        self.max_steps_per_episode = self.get_parameter('max_steps_per_episode').value
+        self.reward_params = self._load_reward_params()
         
         # Create directories if they don't exist
         os.makedirs(self.save_path, exist_ok=True)
@@ -71,7 +80,13 @@ class RLAgentNode(Node):
         self.episode_reward = 0.0
         self.episode_steps = 0
         self.episodes_completed = 0
-        self.max_steps_per_episode = 1000
+        self.prev_action = None
+        self.prev_prev_action = None
+        self.prev_centerline_error = None
+        self.episode_start_time = None
+        self.episode_speeds = []
+        self.episode_steering = []
+        self.total_collisions = 0
         
         self.get_logger().info('RL Agent Node initialized')
     
@@ -105,6 +120,13 @@ class RLAgentNode(Node):
                 self.get_logger().info(f'Loaded model from {self.model_path}')
             except Exception as e:
                 self.get_logger().error(f'Failed to load model: {e}')
+
+    def _declare_reward_params(self):
+        for name, value in DEFAULT_REWARD_PARAMS.items():
+            self.declare_parameter(name, value)
+
+    def _load_reward_params(self):
+        return {name: self.get_parameter(name).value for name in DEFAULT_REWARD_PARAMS}
     
     def scan_callback(self, msg):
         """Store the latest laser scan data"""
@@ -135,8 +157,17 @@ class RLAgentNode(Node):
         """Publish drive command to the car"""
         msg = AckermannDriveStamped()
         msg.drive.steering_angle = float(np.clip(steering, -0.4,0.4))
-        msg.drive.speed = float(np.clip(velocity,0.0,2.0))
+        min_speed = self.reward_params['min_speed']
+        max_speed = self.reward_params['max_speed']
+        msg.drive.speed = float(np.clip(velocity, min_speed, max_speed))
         self.drive_pub.publish(msg)
+
+    def _get_speed_from_odom(self, odom):
+        if odom is None:
+            return 0.0
+        vx = odom.twist.twist.linear.x
+        vy = odom.twist.twist.linear.y
+        return float(np.hypot(vx, vy))
     
     def training_loop(self):
         """Main RL training/inference loop"""
@@ -170,6 +201,14 @@ class RLAgentNode(Node):
             steering, velocity = self.actions[action_idx]
         
         # Execute action
+        scan_features = analyze_scan(self.latest_scan, self.reward_params)
+        target_speed = calculate_target_speed(self.latest_scan, self.reward_params, scan_features)
+        speed_limit = min(
+            self.reward_params['max_speed'],
+            target_speed + self.reward_params['speed_limit_buffer']
+        )
+        speed_limit = max(self.reward_params['min_speed'], speed_limit)
+        velocity = float(np.clip(velocity, self.reward_params['min_speed'], speed_limit))
         self.publish_drive_command(steering, velocity)
         
         # Wait for next observation (handled by callbacks)
@@ -180,12 +219,24 @@ class RLAgentNode(Node):
             reward, done = calculate_reward(
                 self.latest_scan,
                 self.latest_odom,
-                self.prev_odom
+                self.prev_odom,
+                action=[steering, velocity],
+                prev_action=self.prev_action,
+                prev_prev_action=self.prev_prev_action,
+                prev_centerline_error=self.prev_centerline_error,
+                config=self.reward_params
             )
+            self.prev_prev_action = self.prev_action
+            self.prev_action = [steering, velocity]
+            self.prev_centerline_error = scan_features['centerline_error']
             
             # Accumulate episode reward
             self.episode_reward += reward
             self.episode_steps += 1
+            if self.episode_start_time is None:
+                self.episode_start_time = time.time()
+            self.episode_speeds.append(self._get_speed_from_odom(self.latest_odom))
+            self.episode_steering.append(steering)
             
             # Store transition in replay buffer
             next_state = self.get_state()
@@ -198,14 +249,26 @@ class RLAgentNode(Node):
             # Check if episode is done
             if done or self.episode_steps >= self.max_steps_per_episode:
                 self.episodes_completed += 1
+                if scan_features['min_distance'] < self.reward_params['collision_threshold']:
+                    self.total_collisions += 1
                 self.env.reset_car_position()
                 self.get_logger().info("Episode ended! Resetting car position.")
                 
                 # Log episode stats
+                lap_time = 0.0
+                if self.episode_start_time is not None:
+                    lap_time = time.time() - self.episode_start_time
+                avg_speed = float(np.mean(self.episode_speeds)) if self.episode_speeds else 0.0
+                steering_std = float(np.std(self.episode_steering)) if self.episode_steering else 0.0
+                collision_rate = self.total_collisions / max(self.episodes_completed, 1)
                 self.get_logger().info(
                     f'Episode {self.episodes_completed}: '
                     f'Reward={self.episode_reward:.2f}, '
-                    f'Steps={self.episode_steps}'
+                    f'Steps={self.episode_steps}, '
+                    f'LapTime={lap_time:.2f}s, '
+                    f'AvgSpeed={avg_speed:.2f}m/s, '
+                    f'SteeringStd={steering_std:.3f}, '
+                    f'CollisionRate={collision_rate:.2f}'
                 )
                 
                 # Save model periodically
@@ -221,6 +284,12 @@ class RLAgentNode(Node):
                 # Reset episode stats
                 self.episode_reward = 0.0
                 self.episode_steps = 0
+                self.episode_start_time = None
+                self.episode_speeds = []
+                self.episode_steering = []
+                self.prev_action = None
+                self.prev_prev_action = None
+                self.prev_centerline_error = None
                 
                 # Reduce exploration over time
                 self.agent.epsilon = max(

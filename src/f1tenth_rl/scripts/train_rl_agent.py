@@ -9,6 +9,7 @@ import os
 import time
 import argparse
 from datetime import datetime
+import yaml
 
 # Import ROS messages
 from sensor_msgs.msg import LaserScan
@@ -19,7 +20,12 @@ from ackermann_msgs.msg import AckermannDriveStamped
 from f1tenth_rl.environment import F1TenthEnv
 from f1tenth_rl.models.dqn import DQNAgent
 from f1tenth_rl.models.ppo import PPOAgent
-from f1tenth_rl.utils.rewards import calculate_reward
+from f1tenth_rl.utils.rewards import (
+    DEFAULT_REWARD_PARAMS,
+    analyze_scan,
+    calculate_reward,
+    calculate_target_speed
+)
 
 class TrainingNode(Node):
     def __init__(self, args):
@@ -31,6 +37,13 @@ class TrainingNode(Node):
         self.save_dir = args.save_dir
         self.eval_interval = args.eval_interval
         self.load_model = args.load_model
+        self.config_data = self._load_config(args.reward_config)
+        self.reward_params = DEFAULT_REWARD_PARAMS.copy()
+        self.reward_params.update({
+            key: value for key, value in self.config_data.items()
+            if key in DEFAULT_REWARD_PARAMS
+        })
+        self.max_episode_steps = int(self.config_data.get('max_steps_per_episode', 1000))
         
         # Create save directory
         os.makedirs(self.save_dir, exist_ok=True)
@@ -96,6 +109,13 @@ class TrainingNode(Node):
         self.episode_rewards = []
         self.episode_lengths = []
         self.eval_rewards = []
+        self.prev_action = None
+        self.prev_prev_action = None
+        self.prev_centerline_error = None
+        self.episode_start_time = None
+        self.episode_speeds = []
+        self.episode_steering = []
+        self.total_collisions = 0
         
         # Training variables
         self.current_episode = 0
@@ -108,6 +128,19 @@ class TrainingNode(Node):
         
         # Start training loop
         self.timer = self.create_timer(0.1, self.training_step)
+
+    def _load_config(self, config_path):
+        if not config_path:
+            return {}
+        try:
+            with open(config_path, 'r', encoding='utf-8') as handle:
+                data = yaml.safe_load(handle) or {}
+        except Exception as exc:
+            self.get_logger().warning(f"Failed to load config: {exc}")
+            return {}
+        if 'rl_agent' in data and 'ros__parameters' in data['rl_agent']:
+            return data['rl_agent']['ros__parameters'] or {}
+        return data
     
     def scan_callback(self, msg):
         """Store laser scan data"""
@@ -133,8 +166,17 @@ class TrainingNode(Node):
         """Send drive command to the car"""
         msg = AckermannDriveStamped()
         msg.drive.steering_angle = float(steering)
-        msg.drive.speed = float(velocity)
+        min_speed = self.reward_params['min_speed']
+        max_speed = self.reward_params['max_speed']
+        msg.drive.speed = float(np.clip(velocity, min_speed, max_speed))
         self.drive_pub.publish(msg)
+
+    def _get_speed_from_odom(self, odom):
+        if odom is None:
+            return 0.0
+        vx = odom.twist.twist.linear.x
+        vy = odom.twist.twist.linear.y
+        return float(np.hypot(vx, vy))
     
     def training_step(self):
         """Execute one step of the training loop"""
@@ -147,6 +189,9 @@ class TrainingNode(Node):
             self.episode_started = True
             self.episode_reward = 0.0
             self.current_step = 0
+            self.prev_action = None
+            self.prev_prev_action = None
+            self.prev_centerline_error = None
             self.get_logger().info(f"Starting episode {self.current_episode + 1}")
             
             # Reset simulator by publishing zero speed
@@ -170,7 +215,6 @@ class TrainingNode(Node):
                 action_idx = self.agent.select_action(state_tensor)
                 
             steering, velocity = self.actions[action_idx]
-            self.publish_drive_command(steering, velocity)
             
         elif self.algorithm == 'ppo':
             # Sample from policy
@@ -178,7 +222,16 @@ class TrainingNode(Node):
             action, log_prob, value = self.agent.select_action(state_tensor)
             
             steering, velocity = action
-            self.publish_drive_command(steering, velocity)
+        # Apply speed profile constraint before publishing
+        scan_features = analyze_scan(self.latest_scan, self.reward_params)
+        target_speed = calculate_target_speed(self.latest_scan, self.reward_params, scan_features)
+        speed_limit = min(
+            self.reward_params['max_speed'],
+            target_speed + self.reward_params['speed_limit_buffer']
+        )
+        speed_limit = max(self.reward_params['min_speed'], speed_limit)
+        velocity = float(np.clip(velocity, self.reward_params['min_speed'], speed_limit))
+        self.publish_drive_command(steering, velocity)
         
         # Wait for next observation
         if self.prev_odom is None:
@@ -188,12 +241,24 @@ class TrainingNode(Node):
         reward, done = calculate_reward(
             self.latest_scan,
             self.latest_odom,
-            self.prev_odom
+            self.prev_odom,
+            action=[steering, velocity],
+            prev_action=self.prev_action,
+            prev_prev_action=self.prev_prev_action,
+            prev_centerline_error=self.prev_centerline_error,
+            config=self.reward_params
         )
+        self.prev_prev_action = self.prev_action
+        self.prev_action = [steering, velocity]
+        self.prev_centerline_error = scan_features['centerline_error']
         
         # Update step counts
         self.current_step += 1
         self.episode_reward += reward
+        if self.episode_start_time is None:
+            self.episode_start_time = time.time()
+        self.episode_speeds.append(self._get_speed_from_odom(self.latest_odom))
+        self.episode_steering.append(steering)
         
         # Store transition
         next_state = self.get_state()
@@ -218,15 +283,27 @@ class TrainingNode(Node):
                 loss = self.agent.train(next_value)
         
         # Episode end handling
-        if done or self.current_step >= 1000:
+        if done or self.current_step >= self.max_episode_steps:
             self.episode_rewards.append(self.episode_reward)
             self.episode_lengths.append(self.current_step)
+            if scan_features['min_distance'] < self.reward_params['collision_threshold']:
+                self.total_collisions += 1
             
             # Log episode results
+            lap_time = 0.0
+            if self.episode_start_time is not None:
+                lap_time = time.time() - self.episode_start_time
+            avg_speed = float(np.mean(self.episode_speeds)) if self.episode_speeds else 0.0
+            steering_std = float(np.std(self.episode_steering)) if self.episode_steering else 0.0
+            collision_rate = self.total_collisions / max(self.current_episode + 1, 1)
             self.get_logger().info(
                 f"Episode {self.current_episode + 1} finished: "
                 f"Reward={self.episode_reward:.2f}, "
                 f"Steps={self.current_step}, "
+                f"LapTime={lap_time:.2f}s, "
+                f"AvgSpeed={avg_speed:.2f}m/s, "
+                f"SteeringStd={steering_std:.3f}, "
+                f"CollisionRate={collision_rate:.2f}, "
                 f"Epsilon={getattr(self.agent, 'epsilon', 'N/A')}"
             )
             
@@ -250,6 +327,12 @@ class TrainingNode(Node):
             # Reset for next episode
             self.current_episode += 1
             self.episode_started = False
+            self.episode_start_time = None
+            self.episode_speeds = []
+            self.episode_steering = []
+            self.prev_action = None
+            self.prev_prev_action = None
+            self.prev_centerline_error = None
             
             # Check if training is complete
             if self.current_episode >= self.episodes:
@@ -279,13 +362,16 @@ class TrainingNode(Node):
             # Reset environment
             self.publish_drive_command(0.0, 0.0)
             time.sleep(1.0)
+            self.prev_action = None
+            self.prev_prev_action = None
+            self.prev_centerline_error = None
             
             # Run one episode with deterministic policy
             ep_reward = 0.0
             ep_steps = 0
             done = False
             
-            while not done and ep_steps < 1000:
+            while not done and ep_steps < self.max_episode_steps:
                 # Get state
                 state = self.get_state()
                 if state is None:
@@ -302,7 +388,14 @@ class TrainingNode(Node):
                     action, _, _ = self.agent.select_action(state_tensor, deterministic=True)
                     steering, velocity = action
                 
-                # Execute action
+                scan_features = analyze_scan(self.latest_scan, self.reward_params)
+                target_speed = calculate_target_speed(self.latest_scan, self.reward_params, scan_features)
+                speed_limit = min(
+                    self.reward_params['max_speed'],
+                    target_speed + self.reward_params['speed_limit_buffer']
+                )
+                speed_limit = max(self.reward_params['min_speed'], speed_limit)
+                velocity = float(np.clip(velocity, self.reward_params['min_speed'], speed_limit))
                 self.publish_drive_command(steering, velocity)
                 
                 # Wait for next observation
@@ -313,8 +406,16 @@ class TrainingNode(Node):
                     reward, done = calculate_reward(
                         self.latest_scan,
                         self.latest_odom,
-                        self.prev_odom
+                        self.prev_odom,
+                        action=[steering, velocity],
+                        prev_action=self.prev_action,
+                        prev_prev_action=self.prev_prev_action,
+                        prev_centerline_error=self.prev_centerline_error,
+                        config=self.reward_params
                     )
+                    self.prev_prev_action = self.prev_action
+                    self.prev_action = [steering, velocity]
+                    self.prev_centerline_error = scan_features['centerline_error']
                     ep_reward += reward
                 
                 ep_steps += 1
@@ -386,6 +487,8 @@ def main():
                         help='Evaluate every N episodes')
     parser.add_argument('--load-model', type=str, default='',
                         help='Path to model to load (empty for training from scratch)')
+    parser.add_argument('--reward-config', type=str, default='',
+                        help='YAML file with reward/speed profile parameters')
     
     args = parser.parse_args()
     

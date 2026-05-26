@@ -49,7 +49,8 @@ ros2 launch f1tenth_rl rl_agent_launch.py training_mode:=false model_path:=/path
 
 You can modify the parameters in `config/agent_params.yaml` to adjust:
 - Training hyperparameters (learning rate, batch size, etc.)
-- Reward function components and weights
+- Speed profile targets (straight/corner speeds, distance thresholds)
+- Reward function components and weights (speed tracking, centerline, steering smoothness, obstacle clearance)
 
 ## Implementation Details
 

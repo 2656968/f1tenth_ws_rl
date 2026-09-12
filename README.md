@@ -23,14 +23,9 @@ without prior mapping and path planning.
 ---
 
 ## 1. Limitation of Model-Based Control
-<img width="1920" height="1080" alt="슬라이드3" src="https://github.com/user-attachments/assets/96d29c22-2d44-4b5b-af58-eb761a0fef71" />
-
-<img width="1920" height="1080" alt="슬라이드4" src="https://github.com/user-attachments/assets/e6b3e91f-dcab-448e-b077-4adf70cb8a53" />
-
-<img width="1920" height="1080" alt="슬라이드5" src="https://github.com/user-attachments/assets/5f0b5608-cec7-4a43-aec9-76ed7a12bf7a" />
-
-![Uploading 슬라이드7.PNG…]()
-<img width="1920" height="1080" alt="슬라이드6" src="https://github.com/user-attachments/assets/df92ec15-f3f9-4c76-af2b-feb9ee9477d7" />
+<img width="1920" height="1080" alt="슬라이드4" src="https://github.com/user-attachments/assets/f15d1774-b2c4-454e-a9b4-838274e4020d" / <img width="1920" height="1080" alt="슬라이드5" src="https://github.com/user-attachments/assets/64a01700-2fd6-41dc-9b2e-9b75ca84d4ea" / <img width="1920" height="1080" alt="슬라이드6" src="https://github.com/user-attachments/assets/747ce756-07d2-411f-bca1-02b388638cdd" />
+>
+ >
 
 The previous model-based approach required mapping, localization,
 and path planning before autonomous driving.

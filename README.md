@@ -17,7 +17,7 @@ Reinforcement learning based autonomous racing research using the F1TENTH platfo
 
 This project investigates reinforcement learning based autonomous racing
 without prior mapping and path planning.
-<img width="1920" height="1080" alt="슬라이드1" src="https://github.com/user-attachments/assets/ed12684d-0bae-46ad-a41b-d719bfb5586c" /><img width="1920" height="1080" alt="슬라이드2" src="https://github.com/user-attachments/assets/ddde1c07-4674-4e0e-936f-70fc4875fd7c" />
+
 
 
 ---
